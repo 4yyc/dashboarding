@@ -1,0 +1,242 @@
+WITH refined_users AS (
+  SELECT
+    id,
+    regexp_replace(concat(users.last_name, users.first_name), '醫師$|營養師|健康秘書', '') AS name
+  FROM users
+),
+agg_bill_transactions AS (
+  SELECT
+    order_bills.id,
+    SUM(GREATEST(order_transaction_details.amount, 0)) AS 已收金額,
+    -SUM(LEAST(order_transaction_details.amount, 0)) AS 已退金額
+  FROM order_bills
+  JOIN order_payments ON order_bills.id = order_payments.bill_id
+  JOIN order_transaction_details ON order_payments.id = order_transaction_details.payment_id
+  WHERE order_payments.transaction_type IN (0, 1)
+  GROUP BY order_bills.id
+),
+agg_bill_sales_allowances AS (
+  SELECT
+    order_bills.id,
+    order_bills.order_id AS parent_order_id,
+    SUM(order_sales_allowance_items.amount) AS "部分退回(折讓)"
+  FROM order_bills
+  JOIN order_sales_allowances ON order_bills.id = order_sales_allowances.bill_id
+  JOIN order_sales_allowance_items ON order_sales_allowances.id = order_sales_allowance_items.sales_allowance_id
+  GROUP BY order_bills.id, order_bills.order_id
+),
+refined_bill_states AS (
+  SELECT
+    order_bills.id,
+    order_bills.order_id AS parent_order_id,
+    order_bills.total_amount AS 帳單應收款,
+    COALESCE(agg_bill_sales_allowances."部分退回(折讓)", 0) AS "部分退回(折讓)",
+    COALESCE(order_bill_sales_returns.total_amount, 0) AS 全部退回,
+    order_bills.total_amount
+      - COALESCE(agg_bill_sales_allowances."部分退回(折讓)", 0)
+      - COALESCE(order_bill_sales_returns.total_amount, 0) AS 預期收款,
+    COALESCE(agg_bill_transactions.已收金額, 0) AS 已收金額,
+    COALESCE(agg_bill_transactions.已退金額, 0) AS 已退金額,
+    order_bills.total_amount
+      - COALESCE(agg_bill_sales_allowances."部分退回(折讓)", 0)
+      - COALESCE(order_bill_sales_returns.total_amount, 0)
+      - COALESCE(agg_bill_transactions.已收金額, 0)
+      + COALESCE(agg_bill_transactions.已退金額, 0) AS 待結金額,
+    CASE
+      WHEN COALESCE(order_bill_sales_returns.total_amount, 0) = order_bills.total_amount THEN
+        CASE
+          WHEN COALESCE(agg_bill_transactions.已收金額, 0) = COALESCE(agg_bill_transactions.已退金額, 0) THEN '已結清(全退)'
+          WHEN COALESCE(agg_bill_transactions.已收金額, 0) > COALESCE(agg_bill_transactions.已退金額, 0) THEN '未結清(全退)'
+          ELSE '異常(全退)'
+        END
+      WHEN COALESCE(agg_bill_sales_allowances."部分退回(折讓)", 0) > 0 THEN
+        CASE
+          WHEN COALESCE(agg_bill_transactions.已收金額, 0) - COALESCE(agg_bill_transactions.已退金額, 0)
+               = order_bills.total_amount - COALESCE(agg_bill_sales_allowances."部分退回(折讓)", 0)
+          THEN '已結清(有折讓)'
+          ELSE '未結清(有折讓)'
+        END
+      ELSE
+        CASE
+          WHEN COALESCE(agg_bill_transactions.已收金額, 0) - COALESCE(agg_bill_transactions.已退金額, 0) = order_bills.total_amount
+          THEN '已結清'
+          ELSE '未結清'
+        END
+    END AS 訂單狀態
+  FROM order_bills
+  JOIN agg_bill_transactions USING (id)
+  LEFT JOIN agg_bill_sales_allowances USING (id)
+  LEFT JOIN order_bill_sales_returns ON order_bills.id = order_bill_sales_returns.bill_id
+),
+paid_orders AS (
+  SELECT
+    orders.*,
+    order_bills.id AS bill_id,
+    date_trunc('day', orders.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Taipei') AS date
+  FROM orders
+  JOIN order_bills ON orders.id = order_bills.order_id
+  WHERE orders.created_at >= '2024-08-31'
+    AND order_bills.paid_amount > 0
+    AND orders.state <> 900
+),
+ranked_branch_visits AS (
+  SELECT
+    RANK() OVER (PARTITION BY branch_id, client_id, date ORDER BY created_at) AS 預約次數,
+    *
+  FROM branch_visits
+  WHERE date >= '2024-08-31'
+),
+bv_first AS (
+  SELECT * FROM ranked_branch_visits WHERE 預約次數 = 1
+),
+refined_paid_orders AS (
+  SELECT
+    po.id AS paid_order_id,
+    po.bill_id,
+    po.created_at,
+    po.order_date,
+    b.id AS branch_id,
+    b.name AS 分店名稱,
+    po.serial_number AS 訂單編號,
+    CASE
+      WHEN order_type = 'medical_prescription' THEN '醫事處方'
+      WHEN order_type = 'nutrition_planning'   THEN '營養規劃'
+      ELSE '其他'
+    END AS 訂單類別,
+    ocp.real_name AS 客戶名稱,
+    c.name AS 預約名稱,
+    (bv.time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Taipei') AS 預約日期,
+    bv.data ->> 'therapy_stage' AS 預約療程階段,
+    bv.data ->> 'visit_purpose' AS 預約來訪目的,
+    d.name  AS 負責醫師,
+    md.name AS 主營養師,
+    prd.name AS 前諮營養師,
+    sp.name  AS 健康秘書
+  FROM paid_orders po
+  JOIN branches b ON b.id = po.branch_id
+  JOIN org_client_profiles ocp ON ocp.client_id = po.client_id AND ocp.org_id = b.org_id
+  LEFT JOIN refined_users d  ON po.user_id = d.id
+  LEFT JOIN refined_users md ON (po.data -> 'metadata' ->> 'master_dietician_id')::text = md.id::text
+  LEFT JOIN refined_users prd ON (po.data -> 'metadata' ->> 'pre_rd_id')::text            = prd.id::text
+  LEFT JOIN refined_users sp  ON (po.data -> 'metadata' ->> 'salesperson_id')::text       = sp.id::text
+  LEFT JOIN bv_first bv ON po.branch_id = bv.branch_id AND po.client_id = bv.client_id AND po.date = bv.date
+  LEFT JOIN clients c ON bv.client_id = c.id
+),
+refined_payments AS (
+  SELECT
+    op.bill_id,
+    date_trunc('day', op.date_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Taipei') AS date,
+    (op.date_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Taipei') AS date_time,
+    otd.amount AS 交易金額,
+    CASE WHEN bpm.name = '現金'       THEN otd.amount ELSE 0 END AS 現金,
+    CASE WHEN bpm.name = '實體刷卡'   THEN otd.amount ELSE 0 END AS 實體刷卡,
+    CASE WHEN bpm.name = '綠界刷卡機' THEN otd.amount ELSE 0 END AS 綠界刷卡機,
+    CASE WHEN bpm.name = '聯合刷卡機' THEN otd.amount ELSE 0 END AS 聯合刷卡機,
+    CASE WHEN bpm.name = '線上刷卡'   THEN otd.amount ELSE 0 END AS 線上刷卡,
+    CASE WHEN bpm.name = '匯款'       THEN otd.amount ELSE 0 END AS 匯款,
+    CASE WHEN bpm.name = '公關費'     THEN otd.amount ELSE 0 END AS 公關費
+  FROM order_payments op
+  JOIN order_transaction_details otd ON op.id = otd.payment_id
+  LEFT JOIN branch_payment_methods bpm ON bpm.id = otd.branch_payment_method_id
+  WHERE op.transaction_type IN (0, 1)
+),
+agg_order_item_sales_allowances AS (
+  SELECT
+    order_items.id,
+    SUM(order_sales_allowance_items.amount) AS amount,
+    COALESCE(string_agg(order_sales_allowances.description, ', '), '') AS description,
+    COALESCE(string_agg(order_sales_allowance_items.description, ', '), '') AS item_description
+  FROM order_items
+  JOIN order_sales_allowance_items ON order_items.id = order_sales_allowance_items.order_item_id
+  JOIN order_sales_allowances      ON order_sales_allowance_items.sales_allowance_id = order_sales_allowances.id
+  GROUP BY order_items.id
+),
+refined_order_items AS (
+  SELECT
+    COALESCE(orders.parent_id, orders.id) AS parent_order_id,
+    order_items.*,
+    product_categories.name AS category,
+    refined_users.name AS username,
+    CASE
+      WHEN products.productable_type = 'MedicalCare::Therapy' THEN
+        concat(order_items.product_name, '(',
+               medical_care_therapies.serial_code, ' $',
+               to_char(order_items.discounted_amount, 'FM9,999,999'),
+               CASE WHEN COALESCE(a.amount,0) <> 0
+                    THEN rtrim(concat(' 折讓', to_char(a.amount, 'FM9,999,999'), ' ', a.description, ' ', a.item_description))
+               END, ')')
+      WHEN product_categories.name IS NOT NULL THEN
+        concat(order_items.product_name, '(',
+               order_items.data -> 'metadata' -> 'snapshot' ->> 'serial_code', ' $',
+               to_char(order_items.discounted_amount, 'FM9,999,999'),
+               CASE WHEN COALESCE(a.amount,0) <> 0
+                    THEN rtrim(concat(' 折讓', to_char(a.amount, 'FM9,999,999'), ' ', a.description, ' ', a.item_description))
+               END, ')')
+      ELSE
+        concat(order_items.product_name, '(',
+               concat('id=', order_items.product_id),
+               CASE WHEN COALESCE(a.amount,0) <> 0
+                    THEN rtrim(concat(' 折讓', to_char(a.amount, 'FM9,999,999'), ' ', a.description, ' ', a.item_description))
+               END, ')')
+    END AS 商品資訊
+  FROM order_items
+  JOIN orders   ON order_items.order_id = orders.id
+  JOIN products ON order_items.product_id = products.id
+  LEFT JOIN product_categories ON products.id = product_categories.product_id AND product_categories."group" = '會計類別'
+  LEFT JOIN refined_users ON refined_users.id = order_items.user_id
+  LEFT JOIN agg_order_item_sales_allowances a ON order_items.id = a.id
+  LEFT JOIN medical_care_therapies ON medical_care_therapies.id = products.productable_id
+                                    AND products.productable_type = 'MedicalCare::Therapy'
+),
+categories AS (
+  SELECT DISTINCT name
+  FROM product_categories
+  WHERE "group" = '會計類別'
+),
+order_item_user_category_payments AS (
+  SELECT
+    roi.parent_order_id,
+    roi.user_id,
+    roi.username AS 員工姓名,
+    c.name AS 會計類別,
+    (roi.quantity < 0) AS 折抵商品,
+    SUM(CASE WHEN roi.category = c.name THEN oip.amount END) AS amount,
+    (oip.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Taipei') AS 分潤時間,
+    string_agg(roi.商品資訊, ', ') AS 商品資訊
+  FROM refined_order_items roi
+  JOIN order_item_payments oip ON roi.id = oip.item_id
+  CROSS JOIN categories c
+  WHERE roi.parent_id IS NULL
+  GROUP BY roi.parent_order_id, roi.user_id, roi.username, c.name, (roi.quantity < 0), oip.amount, oip.created_at
+  HAVING SUM(CASE WHEN roi.category = c.name THEN oip.amount END) IS NOT NULL
+)
+
+SELECT
+  rpo.paid_order_id AS 訂單ID,
+  to_char(rpo.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Taipei', 'YYYY-MM-DD HH24:MI') AS 訂單建立時間,
+  rpo.分店名稱,
+  rpo.訂單編號,
+  rpo.訂單類別,
+  rpo.客戶名稱,
+  rpo.預約名稱,
+  rpo.預約日期,
+  rpo.負責醫師,
+  rpo.主營養師,
+  rpo.前諮營養師,
+  rpo.健康秘書,
+  oicp.user_id AS 銷售員工ID,
+  oicp.員工姓名 AS 銷售員工姓名,
+  oicp.會計類別,
+  oicp.折抵商品,
+  oicp.amount AS 金額,
+  to_char(oicp.分潤時間, 'YYYY-MM-DD HH24:MI') AS 分潤時間,
+  oicp.商品資訊 AS 商品項目,
+  rpo.預約來訪目的,
+  rpo.預約療程階段
+FROM refined_paid_orders rpo
+JOIN order_item_user_category_payments oicp
+  ON rpo.paid_order_id = oicp.parent_order_id
+LEFT JOIN refined_users ru ON ru.id = oicp.user_id
+WHERE rpo.branch_id = 153
+  AND oicp.分潤時間 >= '2025-09-01'::date
+  AND oicp.分潤時間 <  '2025-10-01'::date;
