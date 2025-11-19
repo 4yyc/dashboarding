@@ -1,0 +1,201 @@
+WITH ib AS (
+    SELECT 
+        member_id,
+        date AS ib_date,
+
+        -- Weight
+        CASE WHEN data->>'weight' ~ '^[0-9]+(\.[0-9]+)?$'
+            THEN (data->>'weight')::numeric
+            ELSE NULL
+        END AS weight,
+
+        -- Body fat mass
+        CASE WHEN data->>'body_fat_mass' ~ '^[0-9]+(\.[0-9]+)?$'
+            THEN (data->>'body_fat_mass')::numeric
+            ELSE NULL
+        END AS body_fat_mass,
+
+        -- Body fat %
+        CASE WHEN data->>'body_fat_mass_percentage' ~ '^[0-9]+(\.[0-9]+)?$'
+            THEN (data->>'body_fat_mass_percentage')::numeric
+            ELSE NULL
+        END AS body_fat_mass_percentage,
+
+        -- Waist
+        CASE WHEN data->>'waist_circumference' ~ '^[0-9]+(\.[0-9]+)?$'
+            THEN (data->>'waist_circumference')::numeric
+            ELSE NULL
+        END AS waist_circumference,
+
+        -- BMI
+        CASE WHEN data->>'bmi' ~ '^[0-9]+(\.[0-9]+)?$'
+            THEN (data->>'bmi')::numeric
+            ELSE NULL
+        END AS bmi,
+
+        -- Muscle mass
+        CASE WHEN data->>'muscle_mass' ~ '^[0-9]+(\.[0-9]+)?$'
+            THEN (data->>'muscle_mass')::numeric
+            ELSE NULL
+        END AS muscle_mass
+
+    FROM measurements
+    WHERE provider = 'InBody'
+),
+
+sb_raw AS (
+    SELECT
+        member_id,
+        date AS sb_date,
+        data->>'hba1c' AS raw_hba1c
+    FROM measurements
+    WHERE provider = 'soft_bio'
+),
+
+sb AS (
+    SELECT
+        member_id,
+        sb_date,
+        CASE
+            WHEN raw_hba1c IS NULL OR raw_hba1c = '' THEN '（待釐清）'
+            WHEN raw_hba1c ~ '^[0-9]+(\.[0-9]+)?$' THEN raw_hba1c
+            ELSE raw_hba1c || '（待釐清）'
+        END AS hba1c
+    FROM sb_raw
+),
+
+orin AS (
+    SELECT
+        pso.created_at AS 出庫時間,
+        pso.returned AS 退藥註記,
+        pm.english_name,
+        pm.chinese_name,
+        pm.minimum_unit,
+        pm.package_amount,
+        pdoi.single_amount AS 次量,
+        pdoi.frequency AS 頻率,
+        pdoi.days AS 天數,
+        pdoi.medicine_amount AS 發藥量,
+        os.client_id AS 客戶ID,
+        os.user_id AS 專家ID,
+        os.order_date AS 訂單日期,
+        os.total AS 總金額
+    FROM pharmacy_stock_outgoings pso
+    LEFT JOIN pharmacy_medicines pm ON pso.medicine_id = pm.id
+    LEFT JOIN pharmacy_dispensation_order_items pdoi ON pso.source_id = pdoi.id
+    LEFT JOIN pharmacy_dispensation_orders pdo ON pdoi.dispensation_order_id = pdo.id
+    LEFT JOIN orders os ON pdo.source_id = os.id
+    WHERE pm.english_name ~* 'Wegovy'
+),
+
+-- Get last order date + 28 days per client
+last_dates AS (
+    SELECT
+        客戶ID,
+        MAX(訂單日期) AS last_order_date,
+        MAX(訂單日期) + INTERVAL '28 days' AS target_date
+    FROM orin
+    GROUP BY 客戶ID
+),
+
+-- Get closest measurements to target_date
+extra_rows AS (
+    SELECT
+        ld.客戶ID,
+        ld.target_date,
+
+        ib_closest.ib_date,
+        ib_closest.weight,
+        ib_closest.body_fat_mass,
+        ib_closest.body_fat_mass_percentage,
+        ib_closest.waist_circumference,
+        ib_closest.bmi,
+        ib_closest.muscle_mass,
+
+        sb_closest.sb_date,
+        sb_closest.hba1c,
+
+        'last_order_plus_28d'::text AS row_type
+    FROM last_dates ld
+
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM ib
+        WHERE ib.member_id = ld.客戶ID
+        ORDER BY ABS(EXTRACT(EPOCH FROM ib.ib_date) - EXTRACT(EPOCH FROM ld.target_date))
+        LIMIT 1
+    ) AS ib_closest ON TRUE
+
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM sb
+        WHERE sb.member_id = ld.客戶ID
+        ORDER BY ABS(EXTRACT(EPOCH FROM sb.sb_date) - EXTRACT(EPOCH FROM ld.target_date))
+        LIMIT 1
+    ) AS sb_closest ON TRUE
+)
+
+-- MAIN QUERY
+SELECT
+    o.*,
+    ib_closest.ib_date,
+    ib_closest.weight,
+    ib_closest.body_fat_mass,
+    ib_closest.body_fat_mass_percentage,
+    ib_closest.waist_circumference,
+    ib_closest.bmi,
+    ib_closest.muscle_mass,
+    sb_closest.sb_date,
+    sb_closest.hba1c,
+    NULL::text AS row_type
+FROM orin o
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM ib
+    WHERE ib.member_id = o.客戶ID
+    ORDER BY ABS(EXTRACT(EPOCH FROM ib.ib_date) - EXTRACT(EPOCH FROM o.訂單日期))
+    LIMIT 1
+) AS ib_closest ON TRUE
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM sb
+    WHERE sb.member_id = o.客戶ID
+    ORDER BY ABS(EXTRACT(EPOCH FROM sb.sb_date) - EXTRACT(EPOCH FROM o.訂單日期))
+    LIMIT 1
+) AS sb_closest ON TRUE
+
+UNION ALL
+
+-- EXTRA +28 DAY ROW
+SELECT
+    NULL::timestamp AS 出庫時間,
+    NULL::boolean  AS 退藥註記,
+    NULL::text     AS english_name,
+    NULL::text     AS chinese_name,
+    NULL::text     AS minimum_unit,
+    NULL::numeric  AS package_amount,
+    NULL::numeric  AS 次量,
+    NULL::text     AS 頻率,
+    NULL::numeric  AS 天數,
+    NULL::numeric  AS 發藥量,
+
+    e.客戶ID,
+    NULL::integer  AS 專家ID,
+    e.target_date AS 訂單日期,
+    NULL::numeric AS 總金額,
+
+    e.ib_date,
+    e.weight,
+    e.body_fat_mass,
+    e.body_fat_mass_percentage,
+    e.waist_circumference,
+    e.bmi,
+    e.muscle_mass,
+
+    e.sb_date,
+    e.hba1c,
+    e.row_type
+
+FROM extra_rows e
+
+ORDER BY 訂單日期;
