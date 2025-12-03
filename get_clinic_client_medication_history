@@ -1,0 +1,95 @@
+WITH orin AS (
+    SELECT
+        pso.created_at AS "出庫時間",
+        pso.returned AS "退藥註記",
+        pm.branch_id,
+        pm.english_name,
+        pm.chinese_name,
+        pm.minimum_unit,
+        pm.package_amount,
+        pdoi.single_amount AS "次量",
+        pdoi.frequency AS "頻率",
+        pdoi.days AS "天數",
+        pdoi.medicine_amount AS "發藥量",
+        os.client_id AS "客戶ID",
+        os.user_id AS "專家ID",
+        os.order_date AS "訂單日期",
+        os.total AS "總金額"
+    FROM pharmacy_stock_outgoings pso
+    LEFT JOIN pharmacy_medicines pm ON pso.medicine_id = pm.id
+    LEFT JOIN Pharmacy_Dispensation_Order_Items pdoi ON pso.source_id = pdoi.id
+    LEFT JOIN Pharmacy_Dispensation_Orders pdo ON pdoi.dispensation_order_id = pdo.id
+    LEFT JOIN orders os ON pdo.source_id = os.id
+    WHERE pm.english_name ~* 'Saxenda|Rybelsus|Ozempic|Wegovy|Mounjaro'
+),
+gco AS (
+    SELECT DISTINCT
+        client_id,
+        TRIM(name) AS name
+    FROM group_class_orders
+    WHERE NOT (name LIKE '%賴珮君%' AND client_id = 909353)
+      AND NOT (name LIKE '%霸軒%' AND client_id = 594749)
+      AND NOT (name LIKE '%歐娜%' AND client_id = 618305)
+      AND NOT (name LIKE '%喪彪%' AND client_id = 671241)
+      AND client_id IS NOT NULL
+      AND LENGTH(TRIM(name)) >= 1
+),
+bv AS (
+    SELECT
+        client_id,
+        branch_id,
+        DATE,
+        TITLE,
+        provider_name,
+        service_name,
+        data ->> 'therapy_stage' AS therapy_stage
+    FROM branch_visits
+    WHERE TITLE !~ '卡位|東東|點滴|EMBODY|純拿藥|營養諮詢'
+      AND state != 4
+),
+target_clients AS (
+    SELECT DISTINCT os.client_id
+    FROM pharmacy_stock_outgoings pso
+    LEFT JOIN pharmacy_medicines pm ON pso.medicine_id = pm.id
+    LEFT JOIN Pharmacy_Dispensation_Order_Items pdoi ON pso.source_id = pdoi.id
+    LEFT JOIN Pharmacy_Dispensation_Orders pdo ON pdoi.dispensation_order_id = pdo.id
+    LEFT JOIN orders os ON pdo.source_id = os.id
+    WHERE pm.chinese_name ~ '週纖達|猛健樂'
+)
+SELECT DISTINCT
+    bs.name AS 診所名,
+    CASE
+        WHEN LENGTH(us.nick_name) < 5 THEN us.last_name
+        WHEN LENGTH(us.nick_name) > 6 THEN us.first_name
+        ELSE us.nick_name
+    END AS 醫師,
+    COALESCE(gco.name, clients.name::text) AS 姓名,
+    orin."出庫時間",
+    orin."退藥註記",
+    orin.branch_id,
+    orin.english_name,
+    orin.chinese_name,
+    orin.minimum_unit,
+    orin.package_amount,
+    orin."次量",
+    orin."頻率",
+    orin."天數",
+    orin."發藥量",
+    orin."客戶ID",
+    orin."專家ID",
+    orin."訂單日期",
+    orin."總金額",
+    bv.title,
+    bv.therapy_stage
+FROM orin
+LEFT JOIN branches bs ON orin.branch_id = bs.id
+LEFT JOIN users us ON us.id = orin."專家ID"
+LEFT JOIN gco ON gco.client_id = orin."客戶ID"
+LEFT JOIN clients ON clients.id = orin."客戶ID"
+LEFT JOIN bv
+    ON bv.client_id = orin."客戶ID"
+   AND bv.branch_id = orin.branch_id
+   AND bv.date = orin."訂單日期"
+INNER JOIN target_clients tc 
+    ON orin."客戶ID" = tc.client_id
+ORDER BY orin."客戶ID", orin."出庫時間" ASC;
