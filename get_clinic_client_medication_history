@@ -56,6 +56,7 @@ target_clients AS (
     LEFT JOIN orders os ON pdo.source_id = os.id
     WHERE pm.chinese_name ~ '週纖達|猛健樂'
 )
+
 SELECT DISTINCT
     bs.name AS 診所名,
     CASE
@@ -63,8 +64,10 @@ SELECT DISTINCT
         WHEN LENGTH(us.nick_name) > 6 THEN us.first_name
         ELSE us.nick_name
     END AS 醫師,
-    COALESCE(gco.name, clients.name::text) AS 姓名,
-    orin."出庫時間",
+    clients.name::text AS 姓名,
+    
+    TO_CHAR(orin."出庫時間", 'YYYY-MM-DD HH24:MI') AS "出庫時間",
+    
     orin."退藥註記",
     orin.branch_id,
     orin.english_name,
@@ -77,19 +80,24 @@ SELECT DISTINCT
     orin."發藥量",
     orin."客戶ID",
     orin."專家ID",
-    orin."訂單日期",
+
+    -- This creates the column alias "訂單日期"
+    TO_CHAR(orin."訂單日期", 'YYYY-MM-DD') AS "訂單日期",
+
     orin."總金額",
     bv.title,
     bv.therapy_stage
+
 FROM orin
 LEFT JOIN branches bs ON orin.branch_id = bs.id
 LEFT JOIN users us ON us.id = orin."專家ID"
-LEFT JOIN gco ON gco.client_id = orin."客戶ID"
 LEFT JOIN clients ON clients.id = orin."客戶ID"
-LEFT JOIN bv
+
+LEFT JOIN bv 
     ON bv.client_id = orin."客戶ID"
-   AND bv.branch_id = orin.branch_id
-   AND bv.date = orin."訂單日期"
+    AND bv.branch_id = orin.branch_id
+    AND bv.date = orin."訂單日期"
+
 INNER JOIN target_clients tc 
     ON orin."客戶ID" = tc.client_id
-ORDER BY orin."客戶ID", orin."出庫時間" ASC;
+--ORDER BY  orin."客戶ID" --"訂單日期" DESC;
